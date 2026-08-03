@@ -13,10 +13,12 @@ jobs:
     container: swift:6.0
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: swift build -v
+      # `-warnings-as-errors` is the point: the README claims a warning-free build,
+      # and a claim nobody can fail is not a claim. This step turns it into one.
+      - name: Build (warnings are errors)
+        run: swift build -Xswiftc -warnings-as-errors
       - name: Test
-        run: swift test -v
+        run: swift test
 
   apple:
     name: build for iOS Simulator + test (macOS)
