@@ -14,7 +14,7 @@ of asserting them in a README.
 
 ```
 swift build   →  clean, 0 warnings, Swift 6 language mode
-swift test    →  142 tests, 0 failures  (Linux + macOS CI, both green)
+swift test    →  147 tests, 0 failures  (Linux + macOS CI, both green)
 demo app      →  resolves this package from GitHub and builds for an iOS Simulator
 ```
 
@@ -189,6 +189,14 @@ unrepresentable.
 treatment is not a user who was assigned treatment. Counting it is direct, silent
 contamination.
 
+**The fail-safe value is not a treatment arm.** `variants` is the set of arms an
+included user can be served; `failSafeVariant` is what everyone else gets. Forcing the
+fail-safe *into* the arm set is what makes a boolean flag impossible to express
+honestly — you declare `["on", "off"]`, and the variant split then hands `off` to half
+of the *included* population, so a "100% rollout" silently ships the feature to 50% of
+users. Keeping them separate lets `variants: ["on"]` mean exactly what it looks like,
+and it is why `payments.express_checkout` in the sample catalog is a one-arm flag.
+
 **Rollout is basis points, not a percentage.** Percent-as-`Int` cannot express a 0.5%
 canary; percent-as-`Double` makes the inclusion comparison floating-point, which is a
 terrible property for something that must be bit-for-bit reproducible across app
@@ -214,6 +222,7 @@ needed.
 
 | Considered | Why not |
 |---|---|
+| Requiring the fail-safe to be one of `variants` | Makes a boolean flag inexpressible; a 100% rollout of `["on","off"]` ships to half the included users. |
 | `Hasher` / `hashValue` for bucketing | Swift seeds its hasher per process. Every cold launch re-randomises every experiment — and no single-process test can catch it. |
 | CRC32 or raw FNV-1a with no finaliser | Weak avalanche in the low bits, which is exactly what `% bucketCount` consumes. Sequential install ids produce visibly lumpy deciles. |
 | Server-side assignment | Correct, and unusable offline or before the first response. Client-side determinism is what makes the flag answerable at launch. |
@@ -237,28 +246,33 @@ needed.
 
 ## Verification — exactly what was checked
 
-- `swift build` — clean, **0 warnings**, Swift 6 language mode (tools-version 6.0).
-- `swift test` — **142 tests, 0 failures**, on Swift 6.0.3 (aarch64 Linux).
-- **CI is green on both jobs at `f4b137a`**, on GitHub's own runners —
-  [run #30808930755](https://github.com/rajatslakhina/rollout-integrity-kit/actions/runs/30808930755):
-  - `ubuntu-latest` / `swift:6.0` container — `swift build` + `swift test`, green.
+- `swift build -Xswiftc -warnings-as-errors` — clean, from a deleted `.build`, in
+  Swift 6 language mode. The flag is the point: "zero warnings" asserted in prose is
+  a claim nobody can fail, so the Linux CI job runs the build *with warnings promoted
+  to errors*. If a warning appears, the badge goes red.
+- `swift test` — **147 tests, 0 failures**, on Swift 6.0.3 (aarch64 Linux).
+- **CI runs on GitHub's own runners** — the badge above reflects the current head,
+  and [the full history is here](https://github.com/rajatslakhina/rollout-integrity-kit/actions):
+  - `ubuntu-latest` / `swift:6.0` container — `swift build -Xswiftc
+    -warnings-as-errors` + `swift test`.
   - `macos-15` — `xcodebuild build -scheme RolloutIntegrityUI -destination
-    'platform=iOS Simulator,name=iPhone 16'` plus `swift test`, green. That job exists
+    'platform=iOS Simulator,name=iPhone 16'` plus `swift test`. That job exists
     because `RolloutIntegrityUI` is compiled out on Linux by `#if canImport(SwiftUI)`;
     it is the only thing that type-checks the SwiftUI layer, and it does so **against
     the iOS SDK** rather than macOS, because iOS-only API drift is exactly what a
     macOS-only build would miss.
 - **The demo app builds for an iOS Simulator, verified independently.** The companion
-  repository's CI resolves this package by its GitHub URL and then compiles the app
-  target —
-  [run #30809373479](https://github.com/rajatslakhina/rollout-integrity-kit-demo-app/actions/runs/30809373479),
-  steps *"Resolve the remote Swift package"* and *"Build for iOS Simulator"*, both
-  green. So the split-repo dependency is not a claim; a machine that had never seen
-  either repo resolved it and built against it.
+  repository's [CI](https://github.com/rajatslakhina/rollout-integrity-kit-demo-app/actions)
+  resolves this package by its GitHub URL (`xcodebuild -resolvePackageDependencies`)
+  and then compiles the app target for an iOS Simulator. So the split-repo dependency
+  is not a claim: a machine that had never seen either repository resolved it and
+  built against it.
 - **0 force-unwraps and 0 `try!`** in `Sources/`. Every collection access is
   bounds-checked; every numeric operation that can trap (`Int(Double)`, `%` by zero,
   `+`/`*` overflow, and `Int.min / -1`) is guarded, clamped or saturating, and
-  `SafeArithmeticTests` exercises each one both directly and through the public API.
+  `SafeArithmeticTests` exercises each one — including the `Int.min / -1` division
+  and the `Int`-range ceiling, which is derived from `Int.max` rather than hardcoded
+  so it stays correct on a 32-bit `Int`.
 - The bucketing golden vector and the audit's frozen fingerprint were produced by an
   **independent Python reimplementation** of FNV-1a/64 + SplitMix64, not by printing
   what the Swift code returns. `testGoldenVectorIsFrozen` fails if the hash ever
@@ -320,7 +334,8 @@ swift test
 ```
 
 Requires Swift 6.0+. The core module is platform-agnostic (it builds and tests on
-Linux); `RolloutIntegrityUI` needs an Apple platform — iOS 17+ / macOS 14+.
+Linux); `RolloutIntegrityUI` needs an Apple platform — iOS 17+ / macOS 14+. tvOS and
+watchOS are deliberately *not* declared, because no CI job builds them.
 
 ### Install
 
