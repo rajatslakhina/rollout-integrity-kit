@@ -19,14 +19,21 @@ jobs:
         run: swift test -v
 
   apple:
-    name: type-check the SwiftUI layer (macOS)
+    name: build for iOS Simulator + test (macOS)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       # The core module is platform-agnostic and is covered by the Linux job.
-      # This job exists specifically so RolloutIntegrityUI — which is compiled
-      # out on Linux by `#if canImport(SwiftUI)` — is actually type-checked.
-      - name: Build all targets
-        run: swift build --target RolloutIntegrityUI
-      - name: Test
+      # This job exists specifically so RolloutIntegrityUI — compiled out on Linux
+      # by `#if canImport(SwiftUI)` — is type-checked, and so it is type-checked
+      # against the *iOS* SDK rather than macOS, because iOS-only API drift is
+      # exactly what a macOS-only build would miss.
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme RolloutIntegrityUI \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Test (macOS)
         run: swift test
