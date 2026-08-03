@@ -44,11 +44,16 @@ public enum BucketDomain {
 public struct FNV1aBucketer: Bucketer {
     public let bucketCount: Int
 
+    /// Largest accepted bucket space. Bounded at the top as well as the bottom
+    /// because callers multiply by `bucketCount` when scaling a rollout threshold,
+    /// and an `Int.max` bucket space would overflow that product.
+    public static let maxBucketCount = 1_000_000
+
     public init(bucketCount: Int = 10_000) {
-        // Clamped rather than precondition-checked: a zero bucket count would
-        // make the modulo trap, and trapping is never an acceptable outcome for
-        // a flag client on a user's device.
-        self.bucketCount = Swift.max(bucketCount, 1)
+        // Clamped rather than precondition-checked: a zero bucket count would make
+        // the modulo trap, and trapping is never an acceptable outcome for a flag
+        // client on a user's device.
+        self.bucketCount = Swift.min(Swift.max(bucketCount, 1), FNV1aBucketer.maxBucketCount)
     }
 
     public func bucket(domain: String, salt: String, identifier: String) -> Int {

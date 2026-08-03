@@ -25,11 +25,21 @@ public enum RulesetApplyOutcome: Hashable, Sendable, CustomStringConvertible {
 /// Everything that must be serialised — the current ruleset, the override set —
 /// lives here, behind actor isolation. What actor isolation buys is *mutual
 /// exclusion*, and nothing else: it does not make a multi-step read-modify-write
-/// atomic across a suspension point. That is why `apply(_:)` and
-/// `decision(for:context:)` each perform their state transition without an
-/// intervening `await` on the shared fields, and why the sticky-store round trip
-/// in `decision` is written so that a lost race can only cost a redundant pin
-/// write, never a changed variant.
+/// atomic across a suspension point.
+///
+/// That distinction is load-bearing in `decision(for:context:)`, which has to
+/// touch the sticky store (an `await`) in the middle of deciding. The naive
+/// shape — read the pin, evaluate, write the pin — is a check-then-act pair
+/// straddling a suspension, so two concurrent first reads of the same flag can
+/// both see "no pin", both evaluate against different rulesets, and the second
+/// can overwrite the first's pin *after* the first has already returned a variant
+/// and recorded an exposure for it. The user ends up counted in one arm and shown
+/// the other.
+///
+/// The fix is not a lock. It is moving the check-then-act inside the store, where
+/// it is one uninterrupted critical section: `StickyAssignmentStore.pinIfAbsent`
+/// returns the authoritative assignment, and this actor **adopts** it rather than
+/// assuming its own computation won.
 public actor RolloutClient {
     private var ruleset: Ruleset
     private var overrides: OverrideSet
@@ -91,25 +101,47 @@ public actor RolloutClient {
         context: EvaluationContext,
         fallbackVariant: String = "off"
     ) async -> FlagDecision {
-        let pinned = await stickyStore.pinned(for: key)
-        // Snapshot the shared state into locals *after* the only `await` above,
-        // so the evaluation below observes one coherent ruleset+override pair.
-        let snapshot = ruleset
-        let currentOverrides = overrides
+        await decision(for: key, in: ruleset, overrides: overrides, context: context, fallbackVariant: fallbackVariant)
+    }
+
+    /// The real implementation. `snapshot` and `activeOverrides` are parameters
+    /// rather than reads of `self`, so a caller that needs several decisions to
+    /// agree can take one snapshot and pass it to all of them.
+    private func decision(
+        for key: FlagKey,
+        in snapshot: Ruleset,
+        overrides activeOverrides: OverrideSet,
+        context: EvaluationContext,
+        fallbackVariant: String
+    ) async -> FlagDecision {
+        let scope = PinScope(key: key, bucketingID: context.identity.bucketingID)
+        let pinned = await stickyStore.pinned(for: scope)
         let instant = clock.now
 
-        let decision = evaluator.evaluate(
+        var decision = evaluator.evaluate(
             key, in: snapshot, context: context, now: instant,
-            overrides: currentOverrides, pinned: pinned, fallbackVariant: fallbackVariant)
+            overrides: activeOverrides, pinned: pinned, fallbackVariant: fallbackVariant)
 
-        guard decision.producesExposure else { return decision }
-
+        // Pin only on an actual assignment. Pinning an exclusion would make raising
+        // the ramp unable to admit that user ever again — see `producesPin`.
         if pinned == nil,
+           decision.producesPin,
            let definition = snapshot.definition(for: key),
            definition.pinPolicy == .pinOnFirstExposure {
-            await stickyStore.pin(PinnedAssignment(
-                key: key, variant: decision.variant, pinnedAtSequence: snapshot.version.sequence))
+            let winner = await stickyStore.pinIfAbsent(PinnedAssignment(
+                scope: scope, variant: decision.variant, pinnedAtSequence: snapshot.version.sequence))
+            if winner.variant != decision.variant {
+                // A concurrent evaluation pinned first. Adopt its answer instead of
+                // our own so the variant served and the variant recorded agree.
+                decision = FlagDecision(
+                    key: key, variant: winner.variant,
+                    reason: .stickyPin(pinnedAtSequence: winner.pinnedAtSequence),
+                    rulesetVersion: decision.rulesetVersion,
+                    inclusionBucket: decision.inclusionBucket, splitBucket: decision.splitBucket)
+            }
         }
+
+        guard decision.producesExposure else { return decision }
 
         await exposures.record(ExposureEvent(
             key: key,
@@ -134,12 +166,22 @@ public actor RolloutClient {
         await decision(for: key, context: context).variant == enabledVariant
     }
 
-    /// Evaluates every flag in the ruleset. Used by the debug surface and by the
-    /// audit; not intended for the hot path.
+    /// Evaluates every flag against **one** ruleset snapshot.
+    ///
+    /// The snapshot is taken here, once, and threaded through every evaluation. That
+    /// is not defensive tidiness: `decision(for:context:)` suspends on the sticky
+    /// store, so a loop that re-read `self.ruleset` on each iteration could observe
+    /// an `apply(_:)` landing midway and return an array whose rows came from two
+    /// different rulesets — one view rendering the old treatment and its sibling the
+    /// new one, which is exactly the torn read `Ruleset`'s own documentation forbids.
     public func decisions(context: EvaluationContext) async -> [FlagDecision] {
+        let snapshot = ruleset
+        let activeOverrides = overrides
         var results: [FlagDecision] = []
-        for key in ruleset.flagKeys {
-            results.append(await decision(for: key, context: context))
+        for key in snapshot.flagKeys {
+            results.append(await decision(
+                for: key, in: snapshot, overrides: activeOverrides,
+                context: context, fallbackVariant: "off"))
         }
         return results
     }
@@ -172,5 +214,9 @@ public actor RolloutClient {
 
     public func discardPins() async {
         await stickyStore.discardAll()
+    }
+
+    public func discardPin(for key: FlagKey, bucketingID: String) async {
+        await stickyStore.discard(PinScope(key: key, bucketingID: bucketingID))
     }
 }

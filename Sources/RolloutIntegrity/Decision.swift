@@ -46,6 +46,32 @@ public enum DecisionReason: Hashable, Sendable, CustomStringConvertible {
             return true
         }
     }
+
+    /// Whether a decision with this reason should be *pinned*.
+    ///
+    /// This is deliberately much narrower than `producesExposure`, and the
+    /// distinction is load-bearing.
+    ///
+    /// Pinning an **exclusion** silently destroys ramp monotonicity at the client
+    /// level: a user evaluated at 10% who was out would be pinned to the fail-safe
+    /// variant, and because the pin outranks the rollout check, raising the ramp to
+    /// 100% could never let them in. The pure evaluator would still be monotonic
+    /// and the client would not be — which is the worst kind of bug, because the
+    /// property test that covers the evaluator would stay green.
+    ///
+    /// Only an actual *assignment* pins: the user was let into the rollout, or a
+    /// targeting rule forced them onto a variant. Being held out, failing safe on
+    /// a stale ruleset, or reading a debug override are all states a user must be
+    /// able to leave.
+    public var producesPin: Bool {
+        switch self {
+        case .rolloutIncluded, .targetingForced:
+            return true
+        case .rolloutExcluded, .targetingExcluded, .staleRulesetFailSafe, .stickyPin,
+             .localOverride, .unknownFlag, .malformedDefinition:
+            return false
+        }
+    }
 }
 
 public struct FlagDecision: Hashable, Sendable {
@@ -73,6 +99,7 @@ public struct FlagDecision: Hashable, Sendable {
     }
 
     public var producesExposure: Bool { reason.producesExposure }
+    public var producesPin: Bool { reason.producesPin }
 
     /// One-line explanation suitable for a log or a support tool.
     public var auditLine: String {
@@ -99,14 +126,45 @@ public struct OverrideSet: Hashable, Sendable {
     public mutating func clearAll() { values.removeAll() }
 }
 
-public struct PinnedAssignment: Hashable, Sendable {
+/// Identifies a pin. Scoped to **both** the flag and the bucketing identity.
+///
+/// Keying pins on the flag alone is a real bug with a boring cause: a store keyed
+/// `[FlagKey: PinnedAssignment]` looks obviously correct right up until the process
+/// evaluates a second identity — a device that signs out and back in as someone
+/// else, a debug tool that previews another user, a test that reuses the client —
+/// and then it serves identity A's pinned variant to identity B.
+public struct PinScope: Hashable, Sendable, Comparable, CustomStringConvertible {
     public let key: FlagKey
+    public let bucketingID: String
+
+    public init(key: FlagKey, bucketingID: String) {
+        self.key = key
+        self.bucketingID = bucketingID
+    }
+
+    public var description: String { "\(key.rawValue)@\(bucketingID)" }
+
+    public static func < (lhs: PinScope, rhs: PinScope) -> Bool {
+        (lhs.key, lhs.bucketingID) < (rhs.key, rhs.bucketingID)
+    }
+}
+
+public struct PinnedAssignment: Hashable, Sendable {
+    public let scope: PinScope
     public let variant: String
     public let pinnedAtSequence: Int
 
-    public init(key: FlagKey, variant: String, pinnedAtSequence: Int) {
-        self.key = key
+    public var key: FlagKey { scope.key }
+    public var bucketingID: String { scope.bucketingID }
+
+    public init(scope: PinScope, variant: String, pinnedAtSequence: Int) {
+        self.scope = scope
         self.variant = variant
         self.pinnedAtSequence = pinnedAtSequence
+    }
+
+    public init(key: FlagKey, bucketingID: String, variant: String, pinnedAtSequence: Int) {
+        self.init(scope: PinScope(key: key, bucketingID: bucketingID),
+                  variant: variant, pinnedAtSequence: pinnedAtSequence)
     }
 }

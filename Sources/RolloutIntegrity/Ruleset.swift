@@ -25,6 +25,8 @@ public enum RulesetValidationError: Error, Hashable, CustomStringConvertible {
     case emptyVariantSet(flag: String)
     case duplicateVariantName(flag: String, variant: String)
     case nonPositiveVariantWeight(flag: String, variant: String, weight: Int)
+    case variantWeightTooLarge(flag: String, variant: String, weight: Int)
+    case tooManyVariants(flag: String, count: Int)
     case failSafeVariantNotInSet(flag: String, failSafe: String)
     case emptyBucketingSalt(flag: String)
     case forcedVariantNotInSet(flag: String, rule: String, variant: String)
@@ -38,6 +40,8 @@ public enum RulesetValidationError: Error, Hashable, CustomStringConvertible {
         case .emptyVariantSet(let f): return "flag '\(f)' has no variants"
         case .duplicateVariantName(let f, let v): return "flag '\(f)' declares variant '\(v)' twice"
         case .nonPositiveVariantWeight(let f, let v, let w): return "flag '\(f)' variant '\(v)' has weight \(w); must be > 0"
+        case .variantWeightTooLarge(let f, let v, let w): return "flag '\(f)' variant '\(v)' has weight \(w); must be <= \(FlagDefinition.maxVariantWeight)"
+        case .tooManyVariants(let f, let c): return "flag '\(f)' declares \(c) variants; must be <= \(FlagDefinition.maxVariantCount)"
         case .failSafeVariantNotInSet(let f, let s): return "flag '\(f)' fail-safe variant '\(s)' is not in its variant set"
         case .emptyBucketingSalt(let f): return "flag '\(f)' has an empty bucketing salt"
         case .forcedVariantNotInSet(let f, let r, let v): return "flag '\(f)' rule '\(r)' forces unknown variant '\(v)'"
@@ -75,6 +79,9 @@ public struct Ruleset: Sendable, Equatable {
     private static func validate(_ flag: FlagDefinition) throws {
         let name = flag.key.rawValue
         guard !flag.variants.isEmpty else { throw RulesetValidationError.emptyVariantSet(flag: name) }
+        guard flag.variants.count <= FlagDefinition.maxVariantCount else {
+            throw RulesetValidationError.tooManyVariants(flag: name, count: flag.variants.count)
+        }
         guard !flag.bucketingSalt.isEmpty else { throw RulesetValidationError.emptyBucketingSalt(flag: name) }
 
         var seenVariants: Set<String> = []
@@ -84,6 +91,12 @@ public struct Ruleset: Sendable, Equatable {
             }
             guard variant.weight > 0 else {
                 throw RulesetValidationError.nonPositiveVariantWeight(flag: name, variant: variant.name, weight: variant.weight)
+            }
+            // Without an upper bound, `[Variant(weight: .max), Variant(weight: .max)]`
+            // passes validation and then traps the first time anything sums the
+            // weights. Reachable from a malformed network payload, not just a fixture.
+            guard variant.weight <= FlagDefinition.maxVariantWeight else {
+                throw RulesetValidationError.variantWeightTooLarge(flag: name, variant: variant.name, weight: variant.weight)
             }
         }
         guard seenVariants.contains(flag.failSafeVariant) else {

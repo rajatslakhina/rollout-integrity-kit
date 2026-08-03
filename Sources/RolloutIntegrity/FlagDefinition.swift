@@ -82,7 +82,33 @@ public struct FlagDefinition: Hashable, Sendable {
         self.pinPolicy = pinPolicy
     }
 
-    public var totalWeight: Int { variants.reduce(0) { $0 + $1.weight } }
+    /// Upper bound on a single variant weight, enforced by `Ruleset` validation.
+    ///
+    /// The bound is not cosmetic: without it, two variants at `Int.max` pass
+    /// validation (`weight > 0` is satisfied) and then trap the moment anything
+    /// sums them. One million is four orders of magnitude finer than the 10,000
+    /// bucket space can resolve, so it costs nothing real.
+    public static let maxVariantWeight = 1_000_000
+
+    /// Upper bound on the number of variants in one flag. 64 is far past any
+    /// honest experiment design and keeps `totalWeight` trivially in range.
+    public static let maxVariantCount = 64
+
+    /// Saturating sum. Validation already bounds the inputs; this is the second
+    /// layer, for definitions built by hand or by a future decoder.
+    public var totalWeight: Int {
+        variants.reduce(0) { SafeMath.addingSaturating($0, $1.weight) }
+    }
+
+    /// The same flag at a different ramp. Everything else — salt, variants,
+    /// weights, rules — is preserved, which is what makes a ramp change a ramp
+    /// change and not a re-randomisation.
+    public func withRollout(_ newRollout: BasisPoints) -> FlagDefinition {
+        FlagDefinition(
+            key: key, variants: variants, failSafeVariant: failSafeVariant,
+            rollout: newRollout, bucketingSalt: bucketingSalt, targetingRules: targetingRules,
+            stalenessClass: stalenessClass, pinPolicy: pinPolicy)
+    }
 
     public func containsVariant(named name: String) -> Bool {
         variants.contains { $0.name == name }
@@ -107,7 +133,7 @@ public struct FlagDefinition: Hashable, Sendable {
         // Scale the bucket into weight space with integer arithmetic; no
         // floating point anywhere on the decision path.
         let clamped = Swift.min(Swift.max(bucket, 0), bucketCount - 1)
-        let scaled = (clamped * total) / bucketCount
+        let scaled = SafeMath.scaled(clamped, by: total, over: bucketCount)
 
         var cumulative = 0
         for variant in variants {

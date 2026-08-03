@@ -1,7 +1,7 @@
 import Foundation
 
-/// Runs the four properties this package claims, against a real population, and
-/// reports numbers rather than assertions.
+/// Runs the six checks this package claims, against a real population, and reports
+/// numbers rather than assertions.
 ///
 /// This exists because "our flag client is correct" is not a checkable statement,
 /// and because every one of these properties fails *silently* in the obvious
@@ -20,8 +20,11 @@ public struct IntegrityAudit: Sendable {
     public struct DeterminismReport: Hashable, Sendable {
         public let populationSize: Int
         public let repeatedEvaluationsMatched: Bool
+        /// Fingerprint of the *canonical* golden population, not of the caller's.
         public let goldenVectorFingerprint: String
-        public var passed: Bool { repeatedEvaluationsMatched }
+        public let expectedFingerprint: String
+        public var goldenVectorMatched: Bool { goldenVectorFingerprint == expectedFingerprint }
+        public var passed: Bool { repeatedEvaluationsMatched && goldenVectorMatched }
     }
 
     public struct MonotonicityReport: Hashable, Sendable {
@@ -47,7 +50,20 @@ public struct IntegrityAudit: Sendable {
         public let chiSquare: Double
         public let degreesOfFreedom: Int
         public let criticalValue: Double
-        public var passed: Bool { chiSquare <= criticalValue }
+        /// False when no critical value is tabulated for this many degrees of
+        /// freedom. `passed` requires it, so an untabulated shape fails **closed**.
+        /// Returning `.infinity` as the threshold instead would make every such
+        /// case pass silently, which is the opposite of the intent.
+        public let isTabulated: Bool
+        public var passed: Bool { isTabulated && chiSquare <= criticalValue }
+    }
+
+    public struct VariantStabilityReport: Hashable, Sendable {
+        public let lowRampPercent: Double
+        public let highRampPercent: Double
+        public let identitiesCheckedAtLowRamp: Int
+        public let variantChangesOnRampUp: Int
+        public var passed: Bool { variantChangesOnRampUp == 0 }
     }
 
     public struct IdentityStabilityReport: Hashable, Sendable {
@@ -59,19 +75,21 @@ public struct IntegrityAudit: Sendable {
     public struct Report: Hashable, Sendable {
         public let determinism: DeterminismReport
         public let monotonicity: MonotonicityReport
+        public let variantStability: VariantStabilityReport
         public let independence: IndependenceReport
         public let uniformity: UniformityReport
         public let identityStability: IdentityStabilityReport
 
         public var passed: Bool {
-            determinism.passed && monotonicity.passed && independence.passed
-                && uniformity.passed && identityStability.passed
+            determinism.passed && monotonicity.passed && variantStability.passed
+                && independence.passed && uniformity.passed && identityStability.passed
         }
 
         public var failedCheckNames: [String] {
             var names: [String] = []
             if !determinism.passed { names.append("determinism") }
             if !monotonicity.passed { names.append("ramp monotonicity") }
+            if !variantStability.passed { names.append("variant stability") }
             if !independence.passed { names.append("cross-flag independence") }
             if !uniformity.passed { names.append("bucket uniformity") }
             if !identityStability.passed { names.append("identity stability") }
@@ -91,22 +109,53 @@ public struct IntegrityAudit: Sendable {
 
     // MARK: Individual checks
 
+    /// Canonical population and salt for the frozen fingerprint. Fixed forever, and
+    /// deliberately independent of whatever flag the caller passes in — a golden
+    /// value computed from caller-supplied inputs is not golden.
+    public static let goldenPopulationSize = 64
+    public static let goldenSalt = "rollout-integrity-golden"
+
+    /// Frozen expected fingerprint of the canonical population.
+    ///
+    /// Produced by an **independent Python reimplementation** of FNV-1a/64 +
+    /// SplitMix64, not by printing what this code returns. That distinction is the
+    /// whole value: a golden value read back out of the implementation it is
+    /// supposed to guard proves only that the code equals itself.
+    public static let goldenFingerprint = "4f04c709d65059ae"
+
+    /// Determinism has two halves, and only the second one can actually fail.
+    ///
+    /// `repeatedEvaluationsMatched` calls the same pure function twice in one
+    /// process, so it holds for *any* within-process-deterministic implementation —
+    /// including `Hasher`, the exact bug this check exists to catch. On its own it
+    /// is unfalsifiable, and an unfalsifiable check is worse than no check because
+    /// it reads like coverage.
+    ///
+    /// `goldenVectorMatched` is the half with teeth: it compares against a constant
+    /// frozen from an independent implementation, so it fails the moment the hash
+    /// drifts — and it would fail immediately under `Hasher`, whose per-process
+    /// seed makes the fingerprint different on every launch.
     public func determinism(population: [String], flag: FlagDefinition) -> DeterminismReport {
         var matched = true
-        var fingerprint: UInt64 = 0xcbf2_9ce4_8422_2325
-
         for identifier in population {
             let first = bucketer.bucket(domain: BucketDomain.inclusion, salt: flag.bucketingSalt, identifier: identifier)
             let second = bucketer.bucket(domain: BucketDomain.inclusion, salt: flag.bucketingSalt, identifier: identifier)
             if first != second { matched = false }
-            fingerprint ^= UInt64(bitPattern: Int64(first))
+        }
+
+        var fingerprint: UInt64 = 0xcbf2_9ce4_8422_2325
+        for index in 0..<IntegrityAudit.goldenPopulationSize {
+            let bucket = bucketer.bucket(
+                domain: BucketDomain.inclusion, salt: IntegrityAudit.goldenSalt, identifier: "install-\(index)")
+            fingerprint ^= UInt64(bitPattern: Int64(bucket))
             fingerprint = fingerprint &* 0x0000_0100_0000_01b3
         }
 
         return DeterminismReport(
             populationSize: population.count,
             repeatedEvaluationsMatched: matched,
-            goldenVectorFingerprint: String(fingerprint, radix: 16))
+            goldenVectorFingerprint: String(fingerprint, radix: 16),
+            expectedFingerprint: IntegrityAudit.goldenFingerprint)
     }
 
     /// Raises the ramp step by step and asserts that nobody ever falls back out.
@@ -118,7 +167,7 @@ public struct IntegrityAudit: Sendable {
         var firstViolation: String?
 
         for step in ascending {
-            let threshold = (step.value * bucketer.bucketCount) / BasisPoints.max.value
+            let threshold = SafeMath.scaled(step.value, by: bucketer.bucketCount, over: BasisPoints.max.value)
             var included: Set<String> = []
             for identifier in population {
                 let bucket = bucketer.bucket(domain: BucketDomain.inclusion, salt: flag.bucketingSalt, identifier: identifier)
@@ -158,8 +207,8 @@ public struct IntegrityAudit: Sendable {
             return IndependenceReport(rolloutPercent: 0, observedJointRate: 0, expectedJointRate: 0,
                                       absoluteDeviation: 0, tolerance: tolerance)
         }
-        let thresholdA = (flagA.rollout.value * bucketer.bucketCount) / BasisPoints.max.value
-        let thresholdB = (flagB.rollout.value * bucketer.bucketCount) / BasisPoints.max.value
+        let thresholdA = SafeMath.scaled(flagA.rollout.value, by: bucketer.bucketCount, over: BasisPoints.max.value)
+        let thresholdB = SafeMath.scaled(flagB.rollout.value, by: bucketer.bucketCount, over: BasisPoints.max.value)
 
         var joint = 0
         for identifier in population {
@@ -185,9 +234,9 @@ public struct IntegrityAudit: Sendable {
     ///
     /// The critical values below are the standard upper-tail 0.1% points; a
     /// chi-square above them means the distribution is lumpy far beyond chance.
-    /// Only the two shapes this package actually uses are tabulated, and an
-    /// unknown `binCount` returns `.infinity` so the check fails loudly rather
-    /// than passing on a value nobody chose.
+    /// Only the shapes this package actually uses are tabulated; for anything else
+    /// `isTabulated` is false and the report fails, rather than silently passing
+    /// against a threshold nobody chose.
     public func uniformity(population: [String], flag: FlagDefinition, binCount: Int = 10) -> UniformityReport {
         let bins = Swift.max(binCount, 1)
         var counts = [Int](repeating: 0, count: bins)
@@ -196,7 +245,7 @@ public struct IntegrityAudit: Sendable {
             let bucket = bucketer.bucket(domain: BucketDomain.inclusion, salt: flag.bucketingSalt, identifier: identifier)
             // `bucket` is in `0..<bucketCount` by the protocol contract; the
             // clamp makes the array write safe even against a hostile conformer.
-            let rawIndex = (bucket * bins) / Swift.max(bucketer.bucketCount, 1)
+            let rawIndex = SafeMath.scaled(bucket, by: bins, over: Swift.max(bucketer.bucketCount, 1))
             let index = Swift.min(Swift.max(rawIndex, 0), bins - 1)
             counts[index] += 1
         }
@@ -215,17 +264,64 @@ public struct IntegrityAudit: Sendable {
             binCounts: counts,
             chiSquare: chiSquare,
             degreesOfFreedom: bins - 1,
-            criticalValue: IntegrityAudit.chiSquareCritical999(degreesOfFreedom: bins - 1))
+            criticalValue: IntegrityAudit.chiSquareCritical999(degreesOfFreedom: bins - 1) ?? .infinity,
+            isTabulated: IntegrityAudit.chiSquareCritical999(degreesOfFreedom: bins - 1) != nil)
     }
 
     /// Upper-tail 0.1% critical values of the chi-square distribution.
-    static func chiSquareCritical999(degreesOfFreedom: Int) -> Double {
+    /// `nil` means "not tabulated" — the caller must fail closed, not guess.
+    static func chiSquareCritical999(degreesOfFreedom: Int) -> Double? {
         switch degreesOfFreedom {
         case 9: return 27.877
         case 19: return 43.820
         case 99: return 148.230
-        default: return .infinity
+        default: return nil
         }
+    }
+
+    /// A user's variant is fixed the moment they enter, and must not move when the
+    /// ramp does.
+    ///
+    /// This is the half of the monotonicity story people miss: you can get inclusion
+    /// right and still reshuffle variants, if the control/treatment split is computed
+    /// over "position within the included population" rather than over the full
+    /// bucket space. Every ramp step then renormalises the boundaries and flips users
+    /// who were already in — invisibly, because the inclusion counts still look
+    /// perfect.
+    public func variantStability(
+        population: [String],
+        flag: FlagDefinition,
+        lowRamp: BasisPoints = BasisPoints(percent: 10),
+        highRamp: BasisPoints = .max,
+        now: Date = Date(timeIntervalSince1970: 0)
+    ) -> VariantStabilityReport {
+        let evaluator = FlagEvaluator(bucketer: bucketer)
+        let lowDefinition = flag.withRollout(lowRamp)
+        let highDefinition = flag.withRollout(highRamp)
+
+        guard
+            let lowRuleset = try? Ruleset(version: RulesetVersion(sequence: 1, etag: "low"), fetchedAt: now, flags: [lowDefinition]),
+            let highRuleset = try? Ruleset(version: RulesetVersion(sequence: 2, etag: "high"), fetchedAt: now, flags: [highDefinition])
+        else {
+            return VariantStabilityReport(
+                lowRampPercent: lowRamp.percent, highRampPercent: highRamp.percent,
+                identitiesCheckedAtLowRamp: 0, variantChangesOnRampUp: 0)
+        }
+
+        var checked = 0
+        var changes = 0
+        for identifier in population {
+            let context = EvaluationContext(identity: AssignmentIdentity(bucketingID: identifier))
+            let atLow = evaluator.evaluate(flag.key, in: lowRuleset, context: context, now: now, fallbackVariant: flag.failSafeVariant)
+            guard case .rolloutIncluded = atLow.reason else { continue }
+            checked += 1
+            let atHigh = evaluator.evaluate(flag.key, in: highRuleset, context: context, now: now, fallbackVariant: flag.failSafeVariant)
+            if atLow.variant != atHigh.variant { changes += 1 }
+        }
+
+        return VariantStabilityReport(
+            lowRampPercent: lowRamp.percent, highRampPercent: highRamp.percent,
+            identitiesCheckedAtLowRamp: checked, variantChangesOnRampUp: changes)
     }
 
     /// Signing in must not move anybody. This is the SRM check.
@@ -254,14 +350,22 @@ public struct IntegrityAudit: Sendable {
         flagB: FlagDefinition,
         ruleset: Ruleset,
         now: Date,
-        rampSteps: [BasisPoints] = [1, 5, 10, 25, 50, 75, 100].map { BasisPoints(percent: Double($0)) },
+        rampSteps: [BasisPoints] = IntegrityAudit.defaultRampLadder,
         binCount: Int = 10
     ) -> Report {
         Report(
             determinism: determinism(population: population, flag: flagA),
             monotonicity: monotonicity(population: population, flag: flagA, steps: rampSteps),
+            variantStability: variantStability(population: population, flag: flagA, now: now),
             independence: independence(population: population, flagA: flagA, flagB: flagB),
             uniformity: uniformity(population: population, flag: flagA, binCount: binCount),
             identityStability: identityStability(population: population, flag: flagA, ruleset: ruleset, now: now))
     }
+
+    /// The ramp ladder the audit walks by default: fourteen steps from 0% to 100%,
+    /// weighted toward the low end where a canary actually lives and where a
+    /// ramp-sensitive bucketer does the most damage per step.
+    public static let defaultRampLadder: [BasisPoints] =
+        [0, 1, 5, 25, 100, 250, 500, 1_000, 2_500, 5_000, 7_500, 9_000, 9_999, 10_000]
+            .map { BasisPoints(clamping: $0) }
 }
