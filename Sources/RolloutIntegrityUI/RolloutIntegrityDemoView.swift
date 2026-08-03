@@ -35,10 +35,15 @@ public final class RolloutExplorerModel {
     public var stalenessDescription: String? {
         guard clockOffsetSeconds > 0, clockOffsetSeconds.isFinite else { return nil }
         let seconds = Int(clockOffsetSeconds.rounded().clampedToIntRange)
-        return "ruleset is \(seconds)s stale — the kill switch has already failed closed"
+        return "ruleset is \(seconds)s stale — payments.express_checkout has failed closed to its held-out value"
     }
 
-    public var rolloutPercent: Double = 50
+    /// Starts at 0 on purpose. Any non-zero start would evaluate `express_pay` as
+    /// *included* before the user touches anything, pin it, and from then on every
+    /// slider position would return the same sticky variant — so the one thing this
+    /// screen exists to show, a user being admitted by raising the ramp, would never
+    /// happen unless you first pressed "Discard pins".
+    public var rolloutPercent: Double = 0
     public var isInternalBuild = false
     public var isSignedIn = false
     public var installID = "install-demo-0184"
@@ -53,14 +58,28 @@ public final class RolloutExplorerModel {
         self.client = RolloutClient(bundledFallback: bundledFallback, clock: clock)
     }
 
-    /// The bucket below which this flag currently includes a user. Rendering it
+    /// The bucket below which this flag includes *this* user right now. Rendering it
     /// beside each bucket is what makes the ramp legible: without it, a slider drag
     /// that has not yet crossed this identity's bucket looks like a broken control
     /// rather than a correct one.
+    ///
+    /// It resolves the **effective** ramp, not the base one — a matching
+    /// `.overrideRollout` rule (internal builds, say) changes the threshold, and
+    /// showing the base value there would print a row reading "in rollout" directly
+    /// above "in below 1000" for a user whose bucket is 8452.
     public func inclusionThreshold(for key: FlagKey) -> Int {
         guard let definition = currentRuleset?.definition(for: key) else { return 0 }
-        return definition.rollout.value
+        var effective = definition.rollout
+        let evaluationContext = context
+        for rule in definition.targetingRules where rule.matches(evaluationContext) {
+            if case .overrideRollout(let override) = rule.effect { effective = override }
+            break
+        }
+        return effective.value
     }
+
+    /// Size of the bucket space, read from the bucketer rather than hardcoded.
+    public let bucketSpace = FNV1aBucketer().bucketCount
 
     public var context: EvaluationContext {
         SampleCatalog.demoContext(
@@ -72,6 +91,7 @@ public final class RolloutExplorerModel {
     /// Publishes a new ruleset at the current ramp and re-evaluates everything.
     public func refresh() async {
         sequence += 1
+        let generation = sequence
         let rollout = BasisPoints(percent: rolloutPercent)
         if let ruleset = try? Ruleset(
             version: RulesetVersion(sequence: sequence, etag: "ramp-\(rollout.value)"),
@@ -79,10 +99,19 @@ public final class RolloutExplorerModel {
             flags: SampleCatalog.allFlags(expressPayRollout: rollout)) {
             await client.apply(ruleset)
         }
+        // `.task(id:)` cancels this task when the slider moves again, but neither
+        // `await` below is a cancellation point — an actor hop is not one — so a
+        // superseded refresh runs to completion and would otherwise publish its
+        // stale results *after* the newer one. The generation check is what actually
+        // prevents that; the `.task(id:)` cancellation alone does not.
+        let ruleset = await client.currentRuleset
+        let freshDecisions = await client.decisions(context: context)
+        let pins = await pinsForCurrentIdentity()
+        guard generation == sequence else { return }
         clockOffsetSeconds = 0
-        currentRuleset = await client.currentRuleset
-        decisions = await client.decisions(context: context)
-        pinnedCount = await pinsForCurrentIdentity()
+        currentRuleset = ruleset
+        decisions = freshDecisions
+        pinnedCount = pins
     }
 
     /// Re-evaluates without publishing a new ruleset — used when only the
@@ -197,7 +226,7 @@ public struct RolloutIntegrityDemoView: View {
         } header: {
             Text("Context")
         } footer: {
-            Text("Drag the ramp up and down. Nobody who is already in ever falls back out, and no variant flips — that is ramp monotonicity, live. Toggle \"Signed in\" and watch every bucket stay exactly where it was. \"Shuffle install\" is a different user, so buckets move and pins do not follow.")
+            Text("Drag the ramp **up**: a user crosses in the moment the threshold passes their bucket, and never falls back out as you keep raising it — that is ramp monotonicity. Drag it back **down** and they stay, but for a different reason: the sticky pin. Toggle \"Signed in\" and every bucket holds exactly where it was. \"Shuffle install\" is a different user, so buckets move and pins do not follow.")
         }
     }
 
@@ -217,7 +246,7 @@ public struct RolloutIntegrityDemoView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if let bucket = decision.inclusionBucket {
-                            Text("bucket \(bucket)/10000 · in below \(model.inclusionThreshold(for: decision.key))\(decision.producesExposure ? "" : " · not counted as an exposure")")
+                            Text("bucket \(bucket)/\(model.bucketSpace) · in below \(model.inclusionThreshold(for: decision.key))\(decision.producesExposure ? "" : " · not counted as an exposure")")
                                 .font(.caption2.monospaced())
                                 .foregroundStyle(.tertiary)
                         }
