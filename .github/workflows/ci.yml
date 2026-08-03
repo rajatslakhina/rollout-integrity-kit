@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: swift build + test (Linux, Swift 6)
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -v
+      - name: Test
+        run: swift test -v
+
+  apple:
+    name: type-check the SwiftUI layer (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # The core module is platform-agnostic and is covered by the Linux job.
+      # This job exists specifically so RolloutIntegrityUI — which is compiled
+      # out on Linux by `#if canImport(SwiftUI)` — is actually type-checked.
+      - name: Build all targets
+        run: swift build --target RolloutIntegrityUI
+      - name: Test
+        run: swift test
