@@ -52,8 +52,50 @@ final class RulesetValidationTests: XCTestCase {
                      [flag(variants: [Variant(name: "off", weight: 1), Variant(name: "on", weight: -3)])])
     }
 
-    func testRejectsFailSafeOutsideVariantSet() {
-        assertThrows(.failSafeVariantNotInSet(flag: "a.flag", failSafe: "nope"), [flag(failSafe: "nope")])
+    /// The fail-safe value is the *held-out* value, not a treatment arm, so it is
+    /// allowed to sit outside `variants` — that is how a boolean flag is expressed
+    /// (`variants: ["on"]`, fail-safe `"off"`). It must still exist.
+    func testFailSafeMaySitOutsideTheTreatmentSet() throws {
+        let ruleset = try Ruleset(version: version, fetchedAt: instant,
+                                  flags: [flag(variants: [Variant(name: "on", weight: 1)], failSafe: "off")])
+        let definition = try XCTUnwrap(ruleset.definition(for: FlagKey("a.flag")))
+        XCTAssertTrue(definition.containsVariant(named: "off"))
+        XCTAssertTrue(definition.containsVariant(named: "on"))
+        XCTAssertFalse(definition.containsVariant(named: "ghost"))
+    }
+
+    func testRejectsEmptyFailSafe() {
+        assertThrows(.emptyFailSafeVariant(flag: "a.flag"), [flag(failSafe: "")])
+    }
+
+    /// A single-arm flag at 100% must serve that arm to everyone. Declaring
+    /// `["on", "off"]` instead would hand "off" to half the included population —
+    /// a "100% rollout" that silently ships to 50% of users.
+    func testBooleanFlagAtFullRampServesEveryoneTheSingleArm() throws {
+        let boolean = FlagDefinition(
+            key: FlagKey("b.flag"), variants: [Variant(name: "on", weight: 1)],
+            failSafeVariant: "off", rollout: .max, bucketingSalt: "salt")
+        let ruleset = try Ruleset(version: version, fetchedAt: instant, flags: [boolean])
+        let evaluator = FlagEvaluator()
+        for index in 0..<500 {
+            let context = EvaluationContext(identity: AssignmentIdentity(bucketingID: "install-\(index)"))
+            let decision = evaluator.evaluate(FlagKey("b.flag"), in: ruleset, context: context,
+                                              now: instant, fallbackVariant: "off")
+            XCTAssertEqual(decision.variant, "on")
+        }
+    }
+
+    func testBooleanFlagAtZeroRampServesTheHeldOutValue() throws {
+        let boolean = FlagDefinition(
+            key: FlagKey("b.flag"), variants: [Variant(name: "on", weight: 1)],
+            failSafeVariant: "off", rollout: .min, bucketingSalt: "salt")
+        let ruleset = try Ruleset(version: version, fetchedAt: instant, flags: [boolean])
+        let evaluator = FlagEvaluator()
+        for index in 0..<200 {
+            let context = EvaluationContext(identity: AssignmentIdentity(bucketingID: "install-\(index)"))
+            XCTAssertEqual(evaluator.evaluate(FlagKey("b.flag"), in: ruleset, context: context,
+                                              now: instant, fallbackVariant: "off").variant, "off")
+        }
     }
 
     func testRejectsEmptySalt() {
@@ -120,7 +162,7 @@ final class RulesetValidationTests: XCTestCase {
         let fallback = SampleCatalog.bundledFallback()
         XCTAssertEqual(fallback.flagCount, 5)
         XCTAssertNotNil(fallback.definition(for: SampleCatalog.Keys.expressPay))
-        XCTAssertNotNil(fallback.definition(for: SampleCatalog.Keys.emergencyDisable))
+        XCTAssertNotNil(fallback.definition(for: SampleCatalog.Keys.expressCheckout))
     }
 }
 

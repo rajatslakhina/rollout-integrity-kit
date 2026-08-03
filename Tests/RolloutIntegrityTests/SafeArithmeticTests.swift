@@ -24,15 +24,32 @@ final class SafeArithmeticTests: XCTestCase {
         XCTAssertEqual(SafeMath.scaled(5_000, by: 10_000, over: 10_000), 5_000)
         XCTAssertEqual(SafeMath.scaled(1, by: .max, over: 1), .max)
         XCTAssertEqual(SafeMath.scaled(10, by: 10, over: 0), 0)
+        // `Int.min / -1` is the one division that overflows and traps.
+        XCTAssertEqual(SafeMath.scaled(.min, by: 1, over: -1), .max)
+        XCTAssertEqual(SafeMath.scaled(1, by: .min, over: -1), .max)
+        XCTAssertEqual(SafeMath.scaled(-100, by: 1, over: -1), 100)
+    }
+
+    /// The `Int`-range ceiling must be derived, not hardcoded, so it is correct on a
+    /// 32-bit `Int` (`arm64_32`, i.e. every watchOS device) as well as 64-bit.
+    func testSafeIntCeilingIsExactlyRepresentableAsADouble() {
+        let ceiling = Double.safeIntCeiling
+        XCTAssertGreaterThan(ceiling, 0)
+        XCTAssertLessThanOrEqual(ceiling, Int.max)
+        XCTAssertEqual(Int(Double(ceiling)), ceiling, "the ceiling must survive an Int -> Double -> Int round trip")
+        XCTAssertEqual(Double(1e400).clampedToIntRange, Double(ceiling))
+        XCTAssertEqual(Double(-1e400).clampedToIntRange, -Double(ceiling))
+        XCTAssertEqual(Double.nan.clampedToIntRange, 0)
     }
 
     func testRoundedClampedToIntHandlesEveryTrappingInput() {
+        let ceiling = Double.safeIntCeiling
         XCTAssertEqual(SafeMath.roundedClampedToInt(.nan), 0)
-        XCTAssertEqual(SafeMath.roundedClampedToInt(.infinity), Int(9.0e18))
+        XCTAssertEqual(SafeMath.roundedClampedToInt(.infinity), ceiling)
         XCTAssertEqual(SafeMath.roundedClampedToInt(-.infinity), 0)
-        XCTAssertEqual(SafeMath.roundedClampedToInt(1e300), Int(9.0e18))
+        XCTAssertEqual(SafeMath.roundedClampedToInt(1e300), ceiling)
         XCTAssertEqual(SafeMath.roundedClampedToInt(-1e300), 0)
-        XCTAssertEqual(SafeMath.roundedClampedToInt(.greatestFiniteMagnitude), Int(9.0e18))
+        XCTAssertEqual(SafeMath.roundedClampedToInt(.greatestFiniteMagnitude), ceiling)
         XCTAssertEqual(SafeMath.roundedClampedToInt(300.4), 300)
         XCTAssertEqual(SafeMath.roundedClampedToInt(300.6), 301)
         XCTAssertEqual(SafeMath.roundedClampedToInt(-5), 0)

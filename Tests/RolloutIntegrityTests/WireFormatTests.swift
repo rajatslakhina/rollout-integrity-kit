@@ -136,11 +136,32 @@ final class WireFormatTests: XCTestCase {
     }
 
     func testDomainValidationStillAppliesAfterDecoding() {
-        let json = validJSON.replacingOccurrences(of: "\"failSafeVariant\": \"control\"", with: "\"failSafeVariant\": \"ghost\"")
+        let json = validJSON.replacingOccurrences(of: "\"failSafeVariant\": \"control\"", with: "\"failSafeVariant\": \"\"")
         XCTAssertThrowsError(try decode(json)) { error in
             XCTAssertEqual(error as? RulesetValidationError,
-                           .failSafeVariantNotInSet(flag: "checkout.express_pay", failSafe: "ghost"))
+                           .emptyFailSafeVariant(flag: "checkout.express_pay"))
         }
+    }
+
+    /// A boolean flag on the wire: one treatment arm, a held-out value outside the
+    /// set. This is the shape the wire format has to be able to express.
+    func testBooleanFlagDecodes() throws {
+        let json = """
+        {"sequence": 1, "etag": "e", "flags": [{
+          "key": "payments.express_checkout",
+          "variants": [{"name": "on", "weight": 1}],
+          "failSafeVariant": "off",
+          "rolloutBasisPoints": 10000,
+          "bucketingSalt": "s",
+          "staleness": "killSwitch",
+          "pinPolicy": "never"
+        }]}
+        """
+        let flag = try XCTUnwrap(try decode(json).definition(for: FlagKey("payments.express_checkout")))
+        XCTAssertEqual(flag.variants.count, 1)
+        XCTAssertEqual(flag.failSafeVariant, "off")
+        XCTAssertEqual(flag.stalenessClass, .killSwitch)
+        XCTAssertTrue(flag.containsVariant(named: "off"))
     }
 
     func testMalformedJSONThrowsADecodingError() {

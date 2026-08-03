@@ -64,11 +64,11 @@ final class RolloutClientTests: XCTestCase {
         _ = await client.apply(try ruleset(sequence: 2, at: start))
         clock.advance(by: 400)
 
-        var decision = await client.decision(for: SampleCatalog.Keys.emergencyDisable, context: SampleCatalog.demoContext())
+        var decision = await client.decision(for: SampleCatalog.Keys.expressCheckout, context: SampleCatalog.demoContext())
         XCTAssertEqual(decision.reason, .staleRulesetFailSafe(ageSeconds: 400, ceilingSeconds: 300))
 
         await client.markRefreshed()
-        decision = await client.decision(for: SampleCatalog.Keys.emergencyDisable, context: SampleCatalog.demoContext())
+        decision = await client.decision(for: SampleCatalog.Keys.expressCheckout, context: SampleCatalog.demoContext())
         XCTAssertNotEqual(decision.reason, .staleRulesetFailSafe(ageSeconds: 400, ceilingSeconds: 300))
     }
 
@@ -187,7 +187,7 @@ final class RolloutClientTests: XCTestCase {
     func testPinPolicyNeverDoesNotPin() async throws {
         let clock = ManualClock(start)
         let client = makeClient(clock: clock)
-        _ = await client.decision(for: SampleCatalog.Keys.emergencyDisable, context: SampleCatalog.demoContext())
+        _ = await client.decision(for: SampleCatalog.Keys.expressCheckout, context: SampleCatalog.demoContext())
         let pins = await client.pinnedAssignments()
         XCTAssertTrue(pins.isEmpty, "a kill switch must never pin")
     }
@@ -299,27 +299,47 @@ final class RolloutClientTests: XCTestCase {
         XCTAssertTrue(["small-10", "medium-25", "large-50"].contains(decision.variant))
     }
 
-    /// Concurrent readers must all observe one coherent ruleset — never a torn
-    /// mix of the old and the new.
-    func testConcurrentReadsAreCoherent() async throws {
+    /// Concurrent readers must each observe one coherent ruleset.
+    ///
+    /// The earlier version of this test applied no second ruleset, so
+    /// `Set(versions).count == 1` was true by construction and would have passed
+    /// against a torn implementation. Here a writer publishes rising sequences the
+    /// whole time the 64 readers run, and the assertion is on the *shape* of each
+    /// reader's own result: a decision's variant must be one the ruleset it names
+    /// could actually have produced, and no decision may carry a version that was
+    /// never published.
+    func testConcurrentReadsStayCoherentWhileRulesetsArePublished() async throws {
         let clock = ManualClock(start)
-        let client = makeClient(clock: clock, rollout: BasisPoints(percent: 100))
+        let client = makeClient(clock: clock, rollout: .max)
         let contexts = (0..<64).map { SampleCatalog.demoContext(installID: "install-\($0)") }
+        let publishedSequences = Array(100..<140)
 
-        let decisions = await withTaskGroup(of: FlagDecision.self, returning: [FlagDecision].self) { group in
+        let decisions = await withTaskGroup(of: [FlagDecision].self, returning: [FlagDecision].self) { group in
+            let pending: [Ruleset] = publishedSequences.compactMap {
+                try? Ruleset(version: RulesetVersion(sequence: $0, etag: "e\($0)"),
+                             fetchedAt: start, flags: SampleCatalog.allFlags(expressPayRollout: .max))
+            }
+            group.addTask {
+                for next in pending { _ = await client.apply(next) }
+                return []
+            }
             for context in contexts {
-                group.addTask { await client.decision(for: SampleCatalog.Keys.feedPageSize, context: context) }
+                group.addTask { [await client.decision(for: SampleCatalog.Keys.feedPageSize, context: context)] }
             }
             var collected: [FlagDecision] = []
-            for await decision in group { collected.append(decision) }
+            for await batch in group { collected.append(contentsOf: batch) }
             return collected
         }
 
         XCTAssertEqual(decisions.count, 64)
-        XCTAssertEqual(Set(decisions.compactMap(\.rulesetVersion)).count, 1,
-                       "all readers must have seen the same ruleset version")
+        let valid = Set([1] + publishedSequences)
         for decision in decisions {
+            let sequence = try XCTUnwrap(decision.rulesetVersion?.sequence)
+            XCTAssertTrue(valid.contains(sequence), "decision carried unpublished ruleset v\(sequence)")
             XCTAssertTrue(["small-10", "medium-25", "large-50"].contains(decision.variant))
         }
+        let finalVersion = await client.currentVersion
+        XCTAssertEqual(finalVersion.sequence, publishedSequences.last,
+                       "the writer's last ruleset must be the one left standing")
     }
 }
