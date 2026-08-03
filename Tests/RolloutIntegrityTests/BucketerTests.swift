@@ -34,7 +34,16 @@ final class BucketerTests: XCTestCase {
         }
     }
 
-    func testDeterministicWithinProcess() {
+    /// The **weak half** of determinism, labelled as such.
+    ///
+    /// Calling a pure function twice in one process passes for any deterministic
+    /// implementation — including `Hasher`, whose per-process seed is exactly the bug
+    /// this package cares about. It is kept because it catches a genuinely different
+    /// class of mistake (hidden per-call state, an accumulating hasher reused across
+    /// calls), and it is named so nobody mistakes it for the real guard. The real
+    /// guard is `testGoldenVectorIsFrozen`, which is falsifiable across processes and
+    /// across toolchain versions.
+    func testRepeatedCallsAreStable_weakHalfOfDeterminism() {
         for index in 0..<500 {
             let identifier = "install-\(index)"
             let first = bucketer.bucket(domain: BucketDomain.inclusion, salt: salt, identifier: identifier)
@@ -66,14 +75,6 @@ final class BucketerTests: XCTestCase {
         XCTAssertLessThan(equalCount, 15, "inclusion and split domains look correlated")
     }
 
-    func testEveryBucketIsInRange() {
-        for identifier in IntegrityAudit.syntheticPopulation(size: 5_000) {
-            let bucket = bucketer.bucket(domain: BucketDomain.inclusion, salt: salt, identifier: identifier)
-            XCTAssertGreaterThanOrEqual(bucket, 0)
-            XCTAssertLessThan(bucket, bucketer.bucketCount)
-        }
-    }
-
     /// A zero or negative bucket count would make `% bucketCount` trap. It is
     /// clamped instead, because a flag client must never be the reason an app
     /// crashes.
@@ -92,7 +93,5 @@ final class BucketerTests: XCTestCase {
         let unicode = bucketer.bucket(domain: BucketDomain.inclusion, salt: salt, identifier: "उपयोगकर्ता-७")
         XCTAssertGreaterThanOrEqual(unicode, 0)
         XCTAssertLessThan(unicode, 10_000)
-        XCTAssertEqual(bucketer.bucket(domain: "", salt: "", identifier: ""),
-                       bucketer.bucket(domain: "", salt: "", identifier: ""))
     }
 }

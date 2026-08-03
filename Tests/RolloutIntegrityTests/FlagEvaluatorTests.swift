@@ -153,7 +153,7 @@ final class FlagEvaluatorTests: XCTestCase {
 
     func testStickyPinIsHonoured() throws {
         let ruleset = try makeRuleset(definition(rollout: .min))
-        let pin = PinnedAssignment(key: key, variant: "on", pinnedAtSequence: 1)
+        let pin = PinnedAssignment(key: key, bucketingID: "install-0", variant: "on", pinnedAtSequence: 1)
         let decision = evaluator.evaluate(key, in: ruleset, context: context(), now: now, pinned: pin, fallbackVariant: "off")
         XCTAssertEqual(decision.variant, "on")
         XCTAssertEqual(decision.reason, .stickyPin(pinnedAtSequence: 1))
@@ -161,7 +161,7 @@ final class FlagEvaluatorTests: XCTestCase {
 
     func testStickyPinIsDiscardedWhenItsVariantIsRemoved() throws {
         let ruleset = try makeRuleset(definition(rollout: .max))
-        let pin = PinnedAssignment(key: key, variant: "variant-deleted-last-release", pinnedAtSequence: 1)
+        let pin = PinnedAssignment(key: key, bucketingID: "install-0", variant: "variant-deleted-last-release", pinnedAtSequence: 1)
         let decision = evaluator.evaluate(key, in: ruleset, context: context(), now: now, pinned: pin, fallbackVariant: "off")
         XCTAssertNotEqual(decision.variant, "variant-deleted-last-release")
         XCTAssertEqual(decision.reason, .rolloutIncluded(ruleID: nil))
@@ -169,7 +169,7 @@ final class FlagEvaluatorTests: XCTestCase {
 
     func testStickyPinIsIgnoredWhenPolicyIsNever() throws {
         let ruleset = try makeRuleset(definition(rollout: .min, pin: .never))
-        let pin = PinnedAssignment(key: key, variant: "on", pinnedAtSequence: 1)
+        let pin = PinnedAssignment(key: key, bucketingID: "install-0", variant: "on", pinnedAtSequence: 1)
         let decision = evaluator.evaluate(key, in: ruleset, context: context(), now: now, pinned: pin, fallbackVariant: "off")
         XCTAssertEqual(decision.variant, "off")
         XCTAssertEqual(decision.reason, .rolloutExcluded(ruleID: nil))
@@ -184,7 +184,7 @@ final class FlagEvaluatorTests: XCTestCase {
             failSafeVariant: "enabled", rollout: .max, bucketingSalt: "salt",
             stalenessClass: .killSwitch, pinPolicy: .pinOnFirstExposure)
         let ruleset = try makeRuleset(killSwitch)
-        let pin = PinnedAssignment(key: key, variant: "disabled", pinnedAtSequence: 1)
+        let pin = PinnedAssignment(key: key, bucketingID: "install-0", variant: "disabled", pinnedAtSequence: 1)
 
         let decision = evaluator.evaluate(key, in: ruleset, context: context(), now: now.addingTimeInterval(3_600),
                                           pinned: pin, fallbackVariant: "enabled")
@@ -196,7 +196,7 @@ final class FlagEvaluatorTests: XCTestCase {
     /// ceiling, so their pins are never disturbed by an outage.
     func testExperimentPinSurvivesAnOutage() throws {
         let ruleset = try makeRuleset(definition(staleness: .experiment))
-        let pin = PinnedAssignment(key: key, variant: "on", pinnedAtSequence: 1)
+        let pin = PinnedAssignment(key: key, bucketingID: "install-0", variant: "on", pinnedAtSequence: 1)
         let decision = evaluator.evaluate(key, in: ruleset, context: context(), now: now.addingTimeInterval(86_400),
                                           pinned: pin, fallbackVariant: "off")
         XCTAssertEqual(decision.reason, .stickyPin(pinnedAtSequence: 1))
@@ -292,6 +292,78 @@ final class FlagEvaluatorTests: XCTestCase {
                            .rolloutExcluded(ruleID: nil))
             XCTAssertEqual(evaluator.evaluate(key, in: all, context: ctx, now: now, fallbackVariant: "off").reason,
                            .rolloutIncluded(ruleID: nil))
+        }
+    }
+
+    /// A pin belonging to a different identity must be ignored. Without the
+    /// identity in the pin's scope, a process that evaluates a second user serves
+    /// the first user's variant to them.
+    func testPinFromAnotherIdentityIsIgnored() throws {
+        let ruleset = try makeRuleset(definition(rollout: .min))
+        let foreignPin = PinnedAssignment(key: key, bucketingID: "some-other-install", variant: "on", pinnedAtSequence: 1)
+        let decision = evaluator.evaluate(key, in: ruleset, context: context("install-0"), now: now,
+                                          pinned: foreignPin, fallbackVariant: "off")
+        XCTAssertEqual(decision.variant, "off")
+        XCTAssertEqual(decision.reason, .rolloutExcluded(ruleID: nil))
+    }
+
+    /// The bucket is the first thing anyone asks for when debugging "why is this
+    /// off for me?", so every decision that has a definition must carry it —
+    /// including the ones that never consulted it.
+    func testEveryDecisionWithADefinitionCarriesItsBuckets() throws {
+        let killSwitch = FlagDefinition(
+            key: key,
+            variants: [Variant(name: "enabled", weight: 1), Variant(name: "disabled", weight: 1)],
+            failSafeVariant: "enabled", rollout: .max, bucketingSalt: "salt",
+            stalenessClass: .killSwitch, pinPolicy: .pinOnFirstExposure)
+        let staleRuleset = try makeRuleset(killSwitch)
+        let stale = evaluator.evaluate(key, in: staleRuleset, context: context(), now: now.addingTimeInterval(3_600), fallbackVariant: "enabled")
+        XCTAssertEqual(stale.reason, .staleRulesetFailSafe(ageSeconds: 3_600, ceilingSeconds: 300))
+        XCTAssertNotNil(stale.inclusionBucket, "a stale fail-safe decision still needs its bucket for support")
+        XCTAssertNotNil(stale.splitBucket)
+
+        let pinnedRuleset = try makeRuleset(definition())
+        let pin = PinnedAssignment(key: key, bucketingID: "install-0", variant: "on", pinnedAtSequence: 1)
+        let pinned = evaluator.evaluate(key, in: pinnedRuleset, context: context(), now: now, pinned: pin, fallbackVariant: "off")
+        XCTAssertEqual(pinned.reason, .stickyPin(pinnedAtSequence: 1))
+        XCTAssertNotNil(pinned.inclusionBucket)
+        XCTAssertNotNil(pinned.splitBucket)
+
+        var overrides = OverrideSet()
+        overrides.set("on", for: key)
+        let overridden = evaluator.evaluate(key, in: pinnedRuleset, context: context(), now: now,
+                                            overrides: overrides, fallbackVariant: "off")
+        XCTAssertEqual(overridden.reason, .localOverride)
+        XCTAssertNotNil(overridden.inclusionBucket)
+    }
+
+    /// Only an actual assignment may pin. Pinning an exclusion would make raising
+    /// the ramp unable to admit that user ever again.
+    func testOnlyAssignmentsProduceAPin() {
+        XCTAssertTrue(DecisionReason.rolloutIncluded(ruleID: nil).producesPin)
+        XCTAssertTrue(DecisionReason.targetingForced(ruleID: "r").producesPin)
+        XCTAssertFalse(DecisionReason.rolloutExcluded(ruleID: nil).producesPin)
+        XCTAssertFalse(DecisionReason.targetingExcluded(ruleID: "r").producesPin)
+        XCTAssertFalse(DecisionReason.staleRulesetFailSafe(ageSeconds: 1, ceilingSeconds: 1).producesPin)
+        XCTAssertFalse(DecisionReason.localOverride.producesPin)
+        XCTAssertFalse(DecisionReason.unknownFlag.producesPin)
+        XCTAssertFalse(DecisionReason.malformedDefinition.producesPin)
+        XCTAssertFalse(DecisionReason.stickyPin(pinnedAtSequence: 1).producesPin)
+    }
+
+    /// Clock skew: a ruleset stamped absurdly in the past must not trap the
+    /// `Int(Double)` conversion in the staleness reason.
+    func testExtremeAgeDoesNotTrapTheStalenessConversion() throws {
+        let killSwitch = FlagDefinition(
+            key: key,
+            variants: [Variant(name: "enabled", weight: 1), Variant(name: "disabled", weight: 1)],
+            failSafeVariant: "enabled", rollout: .max, bucketingSalt: "salt",
+            stalenessClass: .killSwitch, pinPolicy: .never)
+        let ancient = try makeRuleset(killSwitch, fetchedAt: Date(timeIntervalSince1970: -1e300))
+        let decision = evaluator.evaluate(key, in: ancient, context: context(), now: now, fallbackVariant: "enabled")
+        XCTAssertEqual(decision.variant, "enabled")
+        if case .staleRulesetFailSafe = decision.reason {} else {
+            XCTFail("expected a stale fail-safe, got \(decision.reason)")
         }
     }
 

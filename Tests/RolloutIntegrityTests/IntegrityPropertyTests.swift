@@ -178,6 +178,7 @@ final class IntegrityPropertyTests: XCTestCase {
         XCTAssertEqual(report.independence.observedJointRate, 0)
         XCTAssertEqual(report.uniformity.binCounts, [Int](repeating: 0, count: 10))
         XCTAssertEqual(report.uniformity.chiSquare, 0)
+        XCTAssertEqual(report.variantStability.identitiesCheckedAtLowRamp, 0)
     }
 
     func testSyntheticPopulationRejectsNonPositiveSizes() {
@@ -186,13 +187,62 @@ final class IntegrityPropertyTests: XCTestCase {
         XCTAssertEqual(IntegrityAudit.syntheticPopulation(size: 3), ["install-0", "install-1", "install-2"])
     }
 
-    /// An untabulated degrees-of-freedom must fail loudly rather than pass on a
-    /// critical value nobody chose.
+    /// An untabulated degrees-of-freedom must fail **closed**. Returning
+    /// `.infinity` as the threshold — the obvious "no opinion" value — makes every
+    /// such case silently pass, which is the exact opposite of the intent.
     func testUnknownDegreesOfFreedomFailsClosed() {
-        XCTAssertEqual(IntegrityAudit.chiSquareCritical999(degreesOfFreedom: 7), .infinity)
+        XCTAssertNil(IntegrityAudit.chiSquareCritical999(degreesOfFreedom: 7))
+        XCTAssertEqual(IntegrityAudit.chiSquareCritical999(degreesOfFreedom: 9), 27.877)
+
         let report = IntegrityAudit().uniformity(population: population, flag: SampleCatalog.expressPay(), binCount: 8)
-        XCTAssertEqual(report.criticalValue, .infinity)
-        XCTAssertTrue(report.passed, "a finite chi-square is below infinity; the loud failure is the value itself")
+        XCTAssertFalse(report.isTabulated)
+        XCTAssertFalse(report.passed, "no tabulated threshold must mean fail, not pass")
+        XCTAssertLessThan(report.chiSquare, 100, "the distribution itself is fine; only the threshold is missing")
+
+        let tabulated = IntegrityAudit().uniformity(population: population, flag: SampleCatalog.expressPay(), binCount: 10)
+        XCTAssertTrue(tabulated.isTabulated)
+        XCTAssertTrue(tabulated.passed)
+    }
+
+    /// The determinism check must be falsifiable. Half of it (evaluate twice in one
+    /// process) holds for any deterministic function including `Hasher`; the golden
+    /// fingerprint is the half with teeth.
+    func testDeterminismIsFalsifiableViaTheGoldenFingerprint() {
+        let good = IntegrityAudit().determinism(population: population, flag: SampleCatalog.expressPay())
+        XCTAssertTrue(good.goldenVectorMatched)
+        XCTAssertEqual(good.goldenVectorFingerprint, IntegrityAudit.goldenFingerprint)
+        XCTAssertTrue(good.passed)
+
+        // A different (but still perfectly deterministic) hash must fail the check.
+        let drifted = IntegrityAudit(bucketer: SaltShiftedBucketer())
+            .determinism(population: population, flag: SampleCatalog.expressPay())
+        XCTAssertTrue(drifted.repeatedEvaluationsMatched, "still deterministic within the process")
+        XCTAssertFalse(drifted.goldenVectorMatched, "but the fingerprint moved")
+        XCTAssertFalse(drifted.passed, "so the check fails — which is the point")
+    }
+
+    /// A deterministic bucketer that is nonetheless *not this one*.
+    private struct SaltShiftedBucketer: Bucketer {
+        let bucketCount = 10_000
+        func bucket(domain: String, salt: String, identifier: String) -> Int {
+            FNV1aBucketer().bucket(domain: domain, salt: salt + "-drift", identifier: identifier)
+        }
+    }
+
+    func testVariantStabilityIsPartOfTheAudit() {
+        let report = IntegrityAudit().variantStability(population: population, flag: SampleCatalog.expressPay())
+        XCTAssertGreaterThan(report.identitiesCheckedAtLowRamp, 800)
+        XCTAssertEqual(report.variantChangesOnRampUp, 0)
+        XCTAssertTrue(report.passed)
+    }
+
+    /// The README quotes this ladder; keeping the number in one place stops the
+    /// prose and the code drifting apart.
+    func testDefaultRampLadderShape() {
+        XCTAssertEqual(IntegrityAudit.defaultRampLadder.count, 14)
+        XCTAssertEqual(IntegrityAudit.defaultRampLadder.first?.value, 0)
+        XCTAssertEqual(IntegrityAudit.defaultRampLadder.last?.value, 10_000)
+        XCTAssertEqual(IntegrityAudit.defaultRampLadder, IntegrityAudit.defaultRampLadder.sorted())
     }
 
     func testUniformityClampsDegenerateBinCounts() {
@@ -201,33 +251,76 @@ final class IntegrityPropertyTests: XCTestCase {
         XCTAssertEqual(report.binCounts, [population.count])
     }
 
-    /// A deliberately broken bucketer that folds the ramp into the hash — proof
-    /// that the monotonicity check is not vacuous.
-    private struct RampSensitiveBucketer: Bucketer {
+    /// **Mutation test for `IntegrityAudit.monotonicity` itself.**
+    ///
+    /// A property test that cannot fail is worse than no test, because it reads like
+    /// coverage. So: feed the audit a bucketer that re-randomises between ramp steps
+    /// — the exact shape of the bug, a hash that moves when the ramp moves — and
+    /// assert the audit **reports the violation**. If someone gutted `monotonicity`
+    /// to return `violations: 0`, this test would fail, which is the whole point.
+    ///
+    /// Note this drives the real `IntegrityAudit.monotonicity`, not a reimplementation
+    /// of inclusion inline in the test. Asserting that a broken bucketer loses users
+    /// proves something about the bucketer; only calling the audit proves something
+    /// about the audit.
+    func testMonotonicityCheckActuallyDetectsAViolation() {
+        let steps: [BasisPoints] = [10, 20, 30, 40, 50].map { BasisPoints(percent: Double($0)) }
+        let smallPopulation = IntegrityAudit.syntheticPopulation(size: 500)
+
+        let drifting = StepDriftingBucketer(callsPerStep: smallPopulation.count)
+        let brokenReport = IntegrityAudit(bucketer: drifting)
+            .monotonicity(population: smallPopulation, flag: SampleCatalog.expressPay(), steps: steps)
+        XCTAssertGreaterThan(brokenReport.violations, 0,
+                             "the audit failed to notice a bucketer that re-randomises between ramp steps")
+        XCTAssertNotNil(brokenReport.firstViolation)
+        XCTAssertFalse(brokenReport.passed)
+
+        // Control: the real bucketer over the identical inputs must pass.
+        let goodReport = IntegrityAudit()
+            .monotonicity(population: smallPopulation, flag: SampleCatalog.expressPay(), steps: steps)
+        XCTAssertEqual(goodReport.violations, 0)
+        XCTAssertTrue(goodReport.passed)
+    }
+
+    /// A bucketer that quietly changes its mapping every `callsPerStep` calls — i.e.
+    /// once per ramp step, which is what folding the rollout percentage into the hash
+    /// amounts to. Deterministic given a call count, so the test is not flaky.
+    ///
+    /// `@unchecked Sendable` is justified by the lock: `callCount` is private and
+    /// every access is taken under it.
+    private final class StepDriftingBucketer: Bucketer, @unchecked Sendable {
         let bucketCount = 10_000
-        let ramp: Int
+        private let callsPerStep: Int
+        private let lock = NSLock()
+        private var callCount = 0
+
+        init(callsPerStep: Int) { self.callsPerStep = Swift.max(callsPerStep, 1) }
+
         func bucket(domain: String, salt: String, identifier: String) -> Int {
-            FNV1aBucketer().bucket(domain: domain, salt: "\(salt)-\(ramp)", identifier: identifier)
+            lock.lock()
+            let generation = callCount / callsPerStep
+            callCount += 1
+            lock.unlock()
+            return FNV1aBucketer().bucket(domain: domain, salt: "\(salt)-gen\(generation)", identifier: identifier)
         }
     }
 
-    func testMonotonicityCheckActuallyDetectsAViolation() {
-        // Same population, same flag, but the bucket moves with the ramp — which
-        // is exactly the bug. Compare the included sets at two ramps directly.
-        let flag = SampleCatalog.expressPay(rollout: BasisPoints(percent: 10))
-        func includedSet(ramp: Int, thresholdPercent: Double) -> Set<String> {
-            let bucketer = RampSensitiveBucketer(ramp: ramp)
-            let threshold = Int(thresholdPercent * 100)
-            var result: Set<String> = []
-            for identifier in population where
-                bucketer.bucket(domain: BucketDomain.inclusion, salt: flag.bucketingSalt, identifier: identifier) < threshold {
-                result.insert(identifier)
-            }
-            return result
+    /// A conformer that violates the `Bucketer` contract by returning out-of-range
+    /// values. The audit's binning must clamp rather than write out of bounds — which
+    /// is a real assertion about defensive code, unlike checking that
+    /// `Int(x % UInt64(n))` is less than `n`.
+    private struct OutOfRangeBucketer: Bucketer {
+        let bucketCount = 10_000
+        func bucket(domain: String, salt: String, identifier: String) -> Int {
+            identifier.hasSuffix("0") ? Int.min : Int.max
         }
-        let atTen = includedSet(ramp: 10, thresholdPercent: 10)
-        let atTwenty = includedSet(ramp: 20, thresholdPercent: 20)
-        XCTAssertFalse(atTen.subtracting(atTwenty).isEmpty,
-                       "the broken bucketer should lose users across a ramp step; if it does not, the monotonicity test proves nothing")
+    }
+
+    func testAuditBinningClampsAHostileConformer() {
+        let report = IntegrityAudit(bucketer: OutOfRangeBucketer())
+            .uniformity(population: IntegrityAudit.syntheticPopulation(size: 200), flag: SampleCatalog.expressPay(), binCount: 10)
+        XCTAssertEqual(report.binCounts.count, 10)
+        XCTAssertEqual(report.binCounts.reduce(0, +), 200, "every identity must land in some bin")
+        XCTAssertFalse(report.passed, "an obviously degenerate distribution must not pass")
     }
 }

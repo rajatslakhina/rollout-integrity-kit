@@ -93,6 +93,97 @@ final class RolloutClientTests: XCTestCase {
         XCTAssertEqual(second.reason, .stickyPin(pinnedAtSequence: 1))
     }
 
+    /// **The regression test for the bug this package exists to prevent.**
+    ///
+    /// A user evaluated while *out* of the rollout must not be pinned to the
+    /// fail-safe variant. If they were, the pin would outrank the rollout check on
+    /// every later evaluation and raising the ramp could never admit them — the
+    /// pure evaluator would still be monotonic, the client would not be, and the
+    /// evaluator's own property tests would stay green the whole time.
+    func testRampUpAdmitsAPreviouslyExcludedUser() async throws {
+        let clock = ManualClock(start)
+        let client = makeClient(clock: clock, rollout: .min)
+        let context = SampleCatalog.demoContext()
+
+        let excluded = await client.decision(for: SampleCatalog.Keys.expressPay, context: context)
+        XCTAssertEqual(excluded.reason, .rolloutExcluded(ruleID: nil))
+
+        let pins = await client.pinnedAssignments()
+        XCTAssertTrue(pins.isEmpty, "an exclusion must never create a pin")
+
+        _ = await client.apply(try ruleset(sequence: 30, at: clock.now, rollout: .max))
+        let admitted = await client.decision(for: SampleCatalog.Keys.expressPay, context: context)
+        XCTAssertEqual(admitted.reason, .rolloutIncluded(ruleID: nil),
+                       "raising the ramp must be able to admit a user who was previously out")
+    }
+
+    /// The same thing at population scale: walk the ramp up and assert the included
+    /// set only ever grows, through the *client*, pins and all.
+    func testClientLevelRampIsMonotonicAcrossAPopulation() async throws {
+        let clock = ManualClock(start)
+        let client = makeClient(clock: clock, rollout: .min)
+        let identities = (0..<400).map { "install-\($0)" }
+        var previous: Set<String> = []
+        var sequence = 10
+
+        for percent in [0.0, 5.0, 20.0, 50.0, 80.0, 100.0] {
+            sequence += 1
+            _ = await client.apply(try ruleset(sequence: sequence, at: clock.now, rollout: BasisPoints(percent: percent)))
+            var included: Set<String> = []
+            for id in identities {
+                let decision = await client.decision(
+                    for: SampleCatalog.Keys.expressPay, context: SampleCatalog.demoContext(installID: id))
+                switch decision.reason {
+                case .rolloutIncluded, .stickyPin: included.insert(id)
+                default: break
+                }
+            }
+            XCTAssertTrue(previous.subtracting(included).isEmpty,
+                          "\(previous.subtracting(included).count) identities fell out at \(percent)%")
+            previous = included
+        }
+        XCTAssertEqual(previous.count, identities.count, "100% must include everyone")
+    }
+
+    /// Pins must not leak between identities.
+    func testPinsDoNotLeakAcrossIdentities() async throws {
+        let clock = ManualClock(start)
+        let client = makeClient(clock: clock, rollout: .max)
+        let a = SampleCatalog.demoContext(installID: "install-A")
+        let b = SampleCatalog.demoContext(installID: "install-B")
+
+        let first = await client.decision(for: SampleCatalog.Keys.feedPageSize, context: a)
+        let second = await client.decision(for: SampleCatalog.Keys.feedPageSize, context: b)
+
+        XCTAssertEqual(first.reason, .rolloutIncluded(ruleID: nil))
+        XCTAssertEqual(second.reason, .rolloutIncluded(ruleID: nil),
+                       "identity B must be evaluated, not handed identity A's pin")
+        let pins = await client.pinnedAssignments()
+        XCTAssertEqual(Set(pins.map(\.bucketingID)), ["install-A", "install-B"])
+    }
+
+    /// Concurrent first reads must agree: whatever variant is served is the variant
+    /// that got pinned, for every racer.
+    func testConcurrentFirstReadsAgreeWithThePin() async throws {
+        let clock = ManualClock(start)
+        let client = makeClient(clock: clock, rollout: .max)
+        let context = SampleCatalog.demoContext(installID: "install-race")
+
+        let variants = await withTaskGroup(of: String.self, returning: [String].self) { group in
+            for _ in 0..<32 {
+                group.addTask { await client.decision(for: SampleCatalog.Keys.expressPay, context: context).variant }
+            }
+            var collected: [String] = []
+            for await variant in group { collected.append(variant) }
+            return collected
+        }
+
+        XCTAssertEqual(Set(variants).count, 1, "concurrent first reads disagreed: \(Set(variants))")
+        let pins = await client.pinnedAssignments()
+        XCTAssertEqual(pins.count, 1)
+        XCTAssertEqual(pins.first?.variant, variants.first)
+    }
+
     func testPinPolicyNeverDoesNotPin() async throws {
         let clock = ManualClock(start)
         let client = makeClient(clock: clock)
@@ -166,6 +257,28 @@ final class RolloutClientTests: XCTestCase {
         let internalContext = SampleCatalog.demoContext(isInternalBuild: true)
         let enabled = await client.isEnabled(SampleCatalog.Keys.newProfile, context: internalContext)
         XCTAssertTrue(enabled, "internal builds are forced on by the sample ruleset")
+    }
+
+    /// `decisions(context:)` suspends on the sticky store between flags, so a loop
+    /// that re-read `self.ruleset` each iteration could return an array whose rows
+    /// came from two different rulesets — one view rendering the old treatment and
+    /// its sibling the new one. The snapshot is taken once, at the top.
+    func testDecisionsAreCoherentAcrossAConcurrentApply() async throws {
+        let clock = ManualClock(start)
+        let client = makeClient(clock: clock, rollout: .max)
+        let context = SampleCatalog.demoContext(installID: "install-tear")
+
+        async let reading: [FlagDecision] = client.decisions(context: context)
+        // Publish new rulesets while the read is in flight.
+        for sequence in 50..<70 {
+            _ = await client.apply(try ruleset(sequence: sequence, at: clock.now, rollout: .max))
+        }
+        let decisions = await reading
+
+        XCTAssertEqual(decisions.count, 5)
+        let versions = Set(decisions.compactMap(\.rulesetVersion))
+        XCTAssertEqual(versions.count, 1,
+                       "decisions() returned a torn read across \(versions.count) rulesets: \(versions)")
     }
 
     func testDecisionsCoversEveryFlagInTheRuleset() async {
