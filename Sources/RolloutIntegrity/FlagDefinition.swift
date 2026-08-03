@@ -48,9 +48,18 @@ public enum PinPolicy: Hashable, Sendable {
 
 public struct FlagDefinition: Hashable, Sendable {
     public let key: FlagKey
+    /// The **treatment arms**: what an included user can be served. A boolean flag
+    /// has exactly one (`["on"]`); an A/B test has two; a multivariate test has more.
     public let variants: [Variant]
-    /// Served whenever the flag is off, excluded, or failing safe. Must be one of
-    /// `variants`.
+    /// What a user who is *not* served a treatment gets — held out, excluded,
+    /// failing safe on a stale ruleset, or simply out of the rollout.
+    ///
+    /// Deliberately **not** required to be one of `variants`. Forcing it into the
+    /// treatment set is what makes a boolean flag impossible to express honestly:
+    /// you end up declaring `["on", "off"]` and the variant split then hands "off"
+    /// to half of the *included* population, which is not what anybody meant by a
+    /// 100% rollout. Keeping the held-out value separate lets `["on"]` mean exactly
+    /// what it looks like.
     public let failSafeVariant: String
     public let rollout: BasisPoints
     /// Stable per-flag salt. Changing it deliberately re-randomises the whole
@@ -110,8 +119,10 @@ public struct FlagDefinition: Hashable, Sendable {
             stalenessClass: stalenessClass, pinPolicy: pinPolicy)
     }
 
+    /// Whether `name` is a value this flag can legitimately serve — a treatment arm
+    /// or the held-out value.
     public func containsVariant(named name: String) -> Bool {
-        variants.contains { $0.name == name }
+        name == failSafeVariant || variants.contains { $0.name == name }
     }
 
     /// Maps a split bucket to a variant using cumulative weight boundaries.

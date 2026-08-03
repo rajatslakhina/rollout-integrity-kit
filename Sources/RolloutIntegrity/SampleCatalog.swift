@@ -9,7 +9,7 @@ public enum SampleCatalog {
     public enum Keys {
         public static let expressPay = FlagKey("checkout.express_pay")
         public static let searchRanking = FlagKey("search.ranking_v2")
-        public static let emergencyDisable = FlagKey("payments.emergency_disable")
+        public static let expressCheckout = FlagKey("payments.express_checkout")
         public static let feedPageSize = FlagKey("feed.page_size")
         public static let newProfile = FlagKey("profile.redesign")
     }
@@ -52,17 +52,24 @@ public enum SampleCatalog {
             pinPolicy: .pinOnFirstExposure)
     }
 
-    public static func emergencyDisable() -> FlagDefinition {
+    /// A feature guarded by a kill switch.
+    ///
+    /// Note the shape: **one** treatment arm (`on`) and a held-out value (`off`).
+    /// Declaring `["on", "off"]` as two arms would be wrong — the variant split
+    /// would then hand `off` to half of the *included* population, so a "100%
+    /// rollout" would silently ship the feature to 50% of users.
+    ///
+    /// The staleness ceiling is what makes this a kill switch rather than a toggle:
+    /// if the client cannot confirm the ruleset is fresh within five minutes, it
+    /// must assume the switch may have fired since, and serves the held-out value.
+    /// The feature turns **off** when we lose confidence — that is failing closed.
+    public static func expressCheckout() -> FlagDefinition {
         FlagDefinition(
-            key: Keys.emergencyDisable,
-            variants: [Variant(name: "enabled", weight: 1), Variant(name: "disabled", weight: 1)],
-            // Fail-safe is "enabled" — i.e. payments keep working — but the
-            // staleness ceiling means a client that cannot refresh reverts to it
-            // within five minutes instead of serving a possibly-revoked value
-            // forever.
-            failSafeVariant: "enabled",
+            key: Keys.expressCheckout,
+            variants: [Variant(name: "on", weight: 1)],
+            failSafeVariant: "off",
             rollout: .max,
-            bucketingSalt: "payments-killswitch",
+            bucketingSalt: "payments-express-checkout",
             stalenessClass: .killSwitch,
             pinPolicy: .never)
     }
@@ -85,7 +92,7 @@ public enum SampleCatalog {
     public static func newProfile() -> FlagDefinition {
         FlagDefinition(
             key: Keys.newProfile,
-            variants: [Variant(name: "off", weight: 1), Variant(name: "on", weight: 1)],
+            variants: [Variant(name: "on", weight: 1)],
             failSafeVariant: "off",
             rollout: BasisPoints(percent: 25),
             bucketingSalt: "profile-redesign-2026",
@@ -106,7 +113,7 @@ public enum SampleCatalog {
     }
 
     public static func allFlags(expressPayRollout: BasisPoints = BasisPoints(percent: 50)) -> [FlagDefinition] {
-        [expressPay(rollout: expressPayRollout), searchRanking(), emergencyDisable(), feedPageSize(), newProfile()]
+        [expressPay(rollout: expressPayRollout), searchRanking(), expressCheckout(), feedPageSize(), newProfile()]
     }
 
     /// The compiled-in fallback. `try?` is deliberate and safe: the inputs are

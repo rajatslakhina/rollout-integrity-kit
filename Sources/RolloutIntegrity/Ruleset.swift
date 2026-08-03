@@ -27,7 +27,7 @@ public enum RulesetValidationError: Error, Hashable, CustomStringConvertible {
     case nonPositiveVariantWeight(flag: String, variant: String, weight: Int)
     case variantWeightTooLarge(flag: String, variant: String, weight: Int)
     case tooManyVariants(flag: String, count: Int)
-    case failSafeVariantNotInSet(flag: String, failSafe: String)
+    case emptyFailSafeVariant(flag: String)
     case emptyBucketingSalt(flag: String)
     case forcedVariantNotInSet(flag: String, rule: String, variant: String)
     case duplicateRuleID(flag: String, rule: String)
@@ -42,7 +42,7 @@ public enum RulesetValidationError: Error, Hashable, CustomStringConvertible {
         case .nonPositiveVariantWeight(let f, let v, let w): return "flag '\(f)' variant '\(v)' has weight \(w); must be > 0"
         case .variantWeightTooLarge(let f, let v, let w): return "flag '\(f)' variant '\(v)' has weight \(w); must be <= \(FlagDefinition.maxVariantWeight)"
         case .tooManyVariants(let f, let c): return "flag '\(f)' declares \(c) variants; must be <= \(FlagDefinition.maxVariantCount)"
-        case .failSafeVariantNotInSet(let f, let s): return "flag '\(f)' fail-safe variant '\(s)' is not in its variant set"
+        case .emptyFailSafeVariant(let f): return "flag '\(f)' has an empty fail-safe variant"
         case .emptyBucketingSalt(let f): return "flag '\(f)' has an empty bucketing salt"
         case .forcedVariantNotInSet(let f, let r, let v): return "flag '\(f)' rule '\(r)' forces unknown variant '\(v)'"
         case .duplicateRuleID(let f, let r): return "flag '\(f)' declares rule id '\(r)' twice"
@@ -99,8 +99,11 @@ public struct Ruleset: Sendable, Equatable {
                 throw RulesetValidationError.variantWeightTooLarge(flag: name, variant: variant.name, weight: variant.weight)
             }
         }
-        guard seenVariants.contains(flag.failSafeVariant) else {
-            throw RulesetValidationError.failSafeVariantNotInSet(flag: name, failSafe: flag.failSafeVariant)
+        // The fail-safe value may sit outside the treatment set (that is how a
+        // boolean flag is expressed), but it must exist and must not silently
+        // duplicate a treatment arm's meaning by being empty.
+        guard !flag.failSafeVariant.isEmpty else {
+            throw RulesetValidationError.emptyFailSafeVariant(flag: name)
         }
 
         var seenRules: Set<String> = []
@@ -108,7 +111,8 @@ public struct Ruleset: Sendable, Equatable {
             guard seenRules.insert(rule.id).inserted else {
                 throw RulesetValidationError.duplicateRuleID(flag: name, rule: rule.id)
             }
-            if case .forceVariant(let forced) = rule.effect, !seenVariants.contains(forced) {
+            if case .forceVariant(let forced) = rule.effect,
+               !seenVariants.contains(forced), forced != flag.failSafeVariant {
                 throw RulesetValidationError.forcedVariantNotInSet(flag: name, rule: rule.id, variant: forced)
             }
             for condition in rule.conditions {

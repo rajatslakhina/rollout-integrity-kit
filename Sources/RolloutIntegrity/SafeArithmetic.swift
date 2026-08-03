@@ -44,26 +44,42 @@ enum SafeMath {
     /// describes how bad things are and the other decides who gets a feature.
     static func roundedClampedToInt(_ value: Double, upperBound: Int = Int.max) -> Int {
         if value.isNaN { return 0 }
-        if value == .infinity { return Swift.min(upperBound, Int(9.0e18)) }
+        let ceiling = Swift.min(upperBound, Double.safeIntCeiling)
+        if value == .infinity { return ceiling }
         if value == -.infinity { return 0 }
         let rounded = value.rounded()
-        // 9.0e18 is comfortably inside Int64's range (~9.22e18) and comfortably
-        // outside any duration this package will ever see, so it is a safe
-        // conversion boundary that avoids the Double-to-Int rounding hazard at
-        // exactly `Int.max`.
-        let ceiling = Swift.min(Double(upperBound), 9.0e18)
-        if rounded >= ceiling { return Swift.min(upperBound, Int(ceiling)) }
-        if rounded <= -9.0e18 { return 0 }
-        return Swift.max(0, Swift.min(upperBound, Int(rounded)))
+        if rounded >= Double(ceiling) { return ceiling }
+        if rounded <= 0 { return 0 }
+        return Swift.min(ceiling, Int(rounded))
     }
 }
 
 extension Double {
-    /// A finite `Double` clamped into `Int`'s representable range, so `Int(_:)` on
-    /// the result cannot trap. Public because the SwiftUI layer formats durations
-    /// and must not be the one place that reaches for a bare conversion.
+    /// The largest `Int` that is exactly representable as a `Double` on this
+    /// platform, so a round-trip through `Double` cannot overshoot `Int.max`.
+    ///
+    /// Derived from `Int.max` rather than hardcoded, because `Int` is 32-bit on
+    /// `arm64_32` (every watchOS device) and a literal tuned for 64-bit would trap
+    /// there — the precise class of bug this file exists to eliminate. `Double` has
+    /// a 53-bit significand, so the top bits of a 64-bit `Int.max` are not
+    /// representable; masking them off yields a value that is safe in both
+    /// directions.
+    static let safeIntCeiling: Int = {
+        // 2^53 is the largest integer a `Double` represents exactly. Take the
+        // smaller of that and `Int.max`, compared as `Double`s so the choice is made
+        // at runtime and is correct for both a 64-bit `Int` (where 2^53 wins) and a
+        // 32-bit one (where `Int.max` wins).
+        let largestExactDouble = 9_007_199_254_740_992.0  // 2^53
+        return largestExactDouble >= Double(Int.max) ? Int.max : Int(largestExactDouble)
+    }()
+
+    /// A `Double` clamped into `Int`'s exactly-representable range, so `Int(_:)` on
+    /// the result cannot trap on any platform this package supports. Public because
+    /// the SwiftUI layer formats durations and must not be the one place that
+    /// reaches for a bare conversion.
     public var clampedToIntRange: Double {
         if isNaN { return 0 }
-        return Swift.min(Swift.max(self, -9.0e18), 9.0e18)
+        let ceiling = Double(Double.safeIntCeiling)
+        return Swift.min(Swift.max(self, -ceiling), ceiling)
     }
 }
