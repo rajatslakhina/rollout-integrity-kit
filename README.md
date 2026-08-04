@@ -339,8 +339,11 @@ watchOS are deliberately *not* declared, because no CI job builds them.
 
 ### Install
 
+Released versions are tagged; the current one is
+[v1.0.0](https://github.com/rajatslakhina/rollout-integrity-kit/releases/tag/v1.0.0).
+
 ```swift
-.package(url: "https://github.com/rajatslakhina/rollout-integrity-kit.git", branch: "main")
+.package(url: "https://github.com/rajatslakhina/rollout-integrity-kit.git", from: "1.0.0")
 ```
 
 ---
@@ -349,7 +352,7 @@ watchOS are deliberately *not* declared, because no CI job builds them.
 
 **[rollout-integrity-kit-demo-app](https://github.com/rajatslakhina/rollout-integrity-kit-demo-app)**
 — a SwiftUI app that consumes this package by its GitHub URL
-(`XCRemoteSwiftPackageReference`, branch `main`), not by a local path. Drag the ramp
+(`XCRemoteSwiftPackageReference` pinned to `v1.0.0`), not by a local path. Drag the ramp
 slider and watch nobody get kicked out; toggle "Signed in" and watch every bucket stay
 put; run the 10,000-identity audit live.
 
