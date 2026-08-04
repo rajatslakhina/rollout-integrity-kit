@@ -30,11 +30,17 @@ jobs:
       # by `#if canImport(SwiftUI)` — is type-checked, and so it is type-checked
       # against the *iOS* SDK rather than macOS, because iOS-only API drift is
       # exactly what a macOS-only build would miss.
+      # `generic/platform=iOS Simulator` rather than a named device. Naming a
+      # concrete simulator (`name=iPhone 16,OS=latest`) makes the job depend on
+      # which simulator *runtimes* happen to be installed on that day's runner
+      # image — and they are not guaranteed. This job only needs to type-check
+      # and compile against the iOS Simulator SDK, which the generic destination
+      # does without requiring any device to exist.
       - name: Build for iOS Simulator
         run: |
           xcodebuild build \
             -scheme RolloutIntegrityUI \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -destination 'generic/platform=iOS Simulator' \
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO
       - name: Test (macOS)
